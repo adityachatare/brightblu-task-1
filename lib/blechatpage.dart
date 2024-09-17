@@ -1,9 +1,9 @@
 import 'dart:async';
-
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 class BLEChatPage extends StatefulWidget {
   @override
@@ -35,7 +35,19 @@ class _BLEChatPageState extends State<BLEChatPage> {
     await _checkPermissions();
     await _enableLocationServices();
     await _checkBluetoothAvailability();
-    _startScan();
+
+    // Attempt to reconnect to the last connected device
+    SharedPreferences prefs = await SharedPreferences.getInstance();
+    String? lastDeviceId = prefs.getString('lastConnectedDeviceId');
+
+    if (lastDeviceId != null) {
+      BluetoothDevice? device = await _getDeviceById(lastDeviceId);
+      if (device != null) {
+        _connectToDevice(device);
+      }
+    } else {
+      _startScan();
+    }
   }
 
   Future<void> _checkPermissions() async {
@@ -64,7 +76,6 @@ class _BLEChatPageState extends State<BLEChatPage> {
 
   Future<void> _checkBluetoothAvailability() async {
     bool isAvailable = await FlutterBluePlus.isSupported;
-
     final adapterState = FlutterBluePlus.adapterState;
 
     if (!isAvailable) {
@@ -72,7 +83,7 @@ class _BLEChatPageState extends State<BLEChatPage> {
       return;
     }
 
-    if (adapterState.first == BluetoothAdapterState.on) {
+    if (adapterState.first == BluetoothAdapterState.off) {
       print("Bluetooth is turned off. Please turn it on.");
     }
   }
@@ -120,7 +131,7 @@ class _BLEChatPageState extends State<BLEChatPage> {
     await FlutterBluePlus.stopScan(); // Ensure the scan is stopped
     _scanSubscription?.cancel(); // Cancel the stream subscription
     setState(() {
-      _isScanning = false; // Update ui to stop showing the loader
+      _isScanning = false; // Update UI to stop showing the loader
     });
   }
 
@@ -131,15 +142,40 @@ class _BLEChatPageState extends State<BLEChatPage> {
 
     try {
       await device.connect(autoConnect: false);
+      _initializeDeviceListeners(device);
       setState(() {
         _connectedDevice = device;
         _isConnecting = false;
       });
+      // Save the device ID in SharedPreferences
+      SharedPreferences prefs = await SharedPreferences.getInstance();
+      await prefs.setString(
+          'lastConnectedDeviceId', device.remoteId.toString());
     } catch (e) {
       print('Failed to connect: $e');
       setState(() {
         _isConnecting = false;
       });
+    }
+  }
+
+  void _initializeDeviceListeners(BluetoothDevice device) {
+    device.connectionState.listen((state) {
+      if (state == BluetoothConnectionState.disconnected) {
+        print("Device disconnected. Attempting to reconnect...");
+        _reconnectToDevice(device);
+      }
+    });
+  }
+
+  void _reconnectToDevice(BluetoothDevice device) async {
+    try {
+      await device.connect(autoConnect: false);
+      setState(() {
+        _connectedDevice = device;
+      });
+    } catch (e) {
+      print('Failed to reconnect: $e');
     }
   }
 
@@ -150,75 +186,89 @@ class _BLEChatPageState extends State<BLEChatPage> {
         setState(() {
           _connectedDevice = null;
         });
+        // Clear the saved device ID from SharedPreferences
+        SharedPreferences prefs = await SharedPreferences.getInstance();
+        await prefs.remove('lastConnectedDeviceId');
       } catch (e) {
         print('Failed to disconnect: $e');
       }
     }
   }
 
+  Future<BluetoothDevice?> _getDeviceById(String deviceId) async {
+    // This method should scan for devices and return the device with the matching ID
+    List<BluetoothDevice> devices = await FlutterBluePlus.connectedDevices;
+    for (BluetoothDevice device in devices) {
+      if (device.remoteId.toString() == deviceId) {
+        return device;
+      }
+    }
+    return null;
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-        appBar: AppBar(
-          title: const Text('Bluetooth Chat App'),
-          actions: [
-            _isScanning
-                ? IconButton(
-                    icon: const Icon(Icons.stop),
-                    onPressed: _stopScan,
-                  )
-                : IconButton(
-                    icon: const Icon(Icons.refresh),
-                    onPressed: _startScan,
-                  ),
+      appBar: AppBar(
+        title: const Text('Bluetooth Chat App'),
+        actions: [
+          _isScanning
+              ? IconButton(
+                  icon: const Icon(Icons.stop),
+                  onPressed: _stopScan,
+                )
+              : IconButton(
+                  icon: const Icon(Icons.refresh),
+                  onPressed: _startScan,
+                ),
+        ],
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          children: [
+            Text(
+              _connectedDevice != null
+                  ? 'Connected to: ${_connectedDevice!.platformName}'
+                  : 'No device connected',
+              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 20),
+            if (_isConnecting) const CircularProgressIndicator(),
+            if (_connectedDevice == null) ...[
+              if (_isScanning)
+                const Padding(
+                  padding: EdgeInsets.all(8.0),
+                  child: CircularProgressIndicator(),
+                ),
+              Expanded(
+                child: _discoveredDevices.isEmpty
+                    ? const Center(child: Text('No devices found'))
+                    : ListView.builder(
+                        itemCount: _discoveredDevices.length,
+                        itemBuilder: (context, index) {
+                          BluetoothDevice device = _discoveredDevices[index];
+                          String deviceName = device.platformName.isNotEmpty
+                              ? device.platformName
+                              : 'Unknown Device';
+                          return ListTile(
+                            title: Text(deviceName),
+                            subtitle: Text(device.remoteId.toString()),
+                            trailing:
+                                const Icon(Icons.mobile_screen_share_outlined),
+                            onTap: () => _connectToDevice(device),
+                          );
+                        },
+                      ),
+              ),
+            ] else
+              ElevatedButton(
+                onPressed: _disconnectFromDevice,
+                child: const Text('Disconnect'),
+              ),
           ],
         ),
-        body: Padding(
-          padding: const EdgeInsets.all(16.0),
-          child: Column(
-            children: [
-              Text(
-                _connectedDevice != null
-                    ? 'Connected to: ${_connectedDevice!.platformName}'
-                    : 'No device connected',
-                style:
-                    const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-              ),
-              const SizedBox(height: 20),
-              if (_isConnecting) const CircularProgressIndicator(),
-              if (_connectedDevice == null) ...[
-                if (_isScanning)
-                  const Padding(
-                    padding: EdgeInsets.all(8.0),
-                    child: CircularProgressIndicator(),
-                  ),
-                Expanded(
-                  child: _discoveredDevices.isEmpty
-                      ? const Center(child: Text('No devices found'))
-                      : ListView.builder(
-                          itemCount: _discoveredDevices.length,
-                          itemBuilder: (context, index) {
-                            BluetoothDevice device = _discoveredDevices[index];
-                            String deviceName = device.platformName.isNotEmpty
-                                ? device.platformName
-                                : 'Unknown Device';
-                            return ListTile(
-                              title: Text(deviceName),
-                              subtitle: Text(device.remoteId.toString()),
-                              trailing: const Icon(
-                                  Icons.mobile_screen_share_outlined),
-                              onTap: () => _connectToDevice(device),
-                            );
-                          },
-                        ),
-                ),
-              ] else
-                ElevatedButton(
-                  onPressed: _disconnectFromDevice,
-                  child: const Text('Disconnect'),
-                ),
-            ],
-          ),
-        ));
+      ),
+    );
   }
 }
